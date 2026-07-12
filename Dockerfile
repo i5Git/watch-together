@@ -21,7 +21,9 @@ COPY . /usr/src
 
 WORKDIR /usr/src
 
-RUN npm ci
+# NODE_ENV=production is needed at runtime, but Vite and TypeScript are
+# development dependencies required to build the client inside this image.
+RUN npm ci --include=dev --no-audit --no-fund
 
 RUN npm run build
 
