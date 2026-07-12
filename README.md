@@ -2,7 +2,7 @@
 
 Watch is a private watch-together app for synchronized video playback, room chat, subtitles, and mobile-friendly rooms.
 
-This repository is a rebranded and redesigned fork of the open-source WatchParty project. The upstream project and its contributors remain credited in the repository history and [LICENSE](./LICENSE). This fork keeps the original MIT license obligations.
+This is the standalone Watch repository, based on the open-source WatchParty project. The upstream project and its contributors remain credited in the repository history and [LICENSE](./LICENSE). Watch keeps the original MIT license obligations.
 
 ## What changed
 
@@ -17,28 +17,43 @@ This repository is a rebranded and redesigned fork of the open-source WatchParty
 
 ## Quick start on Ubuntu
 
-The recommended deployment path uses Docker Compose and restarts automatically after reboot.
+The easiest deployment path downloads the installer, clones Watch into `/opt/watch`, installs Docker Compose, starts the service, and restarts it after reboot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | bash -s -- --yes
+```
+
+The installer defaults to port `8080` and Docker Compose. It prints the final URL and status/log commands when it finishes.
+
+For an interactive setup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | bash
+```
+
+Useful options:
+
+```bash
+# Update the existing /opt/watch checkout and rebuild it.
+curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | bash -s -- --update --yes
+
+# Use another directory or public port.
+curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | \
+  bash -s -- --yes --dir /srv/watch --port 8080
+
+# Prompt for optional Firebase, Stripe, TURN, Postgres, and Redis configuration.
+curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | \
+  bash -s -- --advanced
+```
+
+If you already cloned the repository:
 
 ```bash
 chmod +x scripts/install-ubuntu.sh
-./scripts/install-ubuntu.sh
+./scripts/install-ubuntu.sh --yes
 ```
 
-The installer:
-
-1. Installs required Ubuntu packages.
-2. Prompts for the repository path, public port, optional Firebase/Stripe/TURN/server configuration, and deployment mode.
-3. Writes a permission-restricted `.env` file.
-4. Builds and starts the service with Docker Compose (`restart: unless-stopped`) or creates a systemd service.
-5. Prints the final URL, status command, and log command.
-
-To update an existing Docker installation:
-
-```bash
-./scripts/install-ubuntu.sh --update
-```
-
-The updater pulls the current branch and rebuilds the Compose service without rewriting the existing `.env`.
+The updater pulls the `main` branch and rebuilds the Compose service without overwriting an existing `.env`.
 
 ## Manual Docker deployment
 

@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+readonly DEFAULT_REPO_URL="https://github.com/i5Git/watch-together.git"
+readonly DEFAULT_INSTALL_DIR="/opt/watch"
 readonly SERVICE_NAME="watch"
 
-SUDO=""
+SUDO=()
 if [[ "${EUID}" -ne 0 ]]; then
-  SUDO="sudo"
+  SUDO=(sudo)
 fi
+
+run_privileged() {
+  "${SUDO[@]}" "$@"
+}
 
 log() {
   printf '\n[Watch] %s\n' "$1"
@@ -19,53 +23,231 @@ fail() {
   exit 1
 }
 
-prompt_value() {
-  local variable_name="$1"
-  local prompt="$2"
-  local default_value="$3"
+usage() {
+  cat <<'EOF'
+Install Watch on Ubuntu/Debian with Docker Compose:
+
+  curl -fsSL https://raw.githubusercontent.com/i5Git/watch-together/main/scripts/install-ubuntu.sh | bash -s -- --yes
+
+Options:
+  --yes                 Accept defaults without prompting.
+  --update              Pull the existing checkout and rebuild it.
+  --advanced            Prompt for optional Firebase, Stripe, TURN, database, and Redis values.
+  --mode docker|native  Deployment mode. Docker is the default.
+  --dir PATH            Installation directory. Default: /opt/watch.
+  --port PORT           Public host port. Default: 8080.
+  --host HOST           Public hostname or IP used in the final URL.
+  --repo URL            Git repository to install.
+  --help                Show this help.
+EOF
+}
+
+SCRIPT_DIR=""
+if SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"; then
+  :
+else
+  SCRIPT_DIR=""
+fi
+
+LOCAL_REPO_DIR=""
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/../package.json" ]]; then
+  LOCAL_REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+fi
+
+INSTALL_USER="${SUDO_USER:-$(id -un)}"
+INSTALL_GROUP="$(id -gn "${INSTALL_USER}" 2>/dev/null || printf '%s' "${INSTALL_USER}")"
+DEFAULT_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+DEFAULT_HOST="${DEFAULT_HOST:-localhost}"
+
+REPO_URL="${WATCH_REPO_URL:-${DEFAULT_REPO_URL}}"
+INSTALL_DIR="${WATCH_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
+APP_PORT="${WATCH_PORT:-8080}"
+PUBLIC_HOST="${WATCH_HOST:-${DEFAULT_HOST}}"
+DEPLOY_MODE="docker"
+UPDATE_ONLY="0"
+ASSUME_YES="0"
+ADVANCED="0"
+
+VITE_SERVER_HOST=""
+VITE_FIREBASE_CONFIG=""
+VITE_STRIPE_PUBLIC_KEY=""
+VITE_OAUTH_REDIRECT_HOSTNAME=""
+VITE_TURN_SERVERS=""
+VITE_TURN_USERNAME=""
+VITE_TURN_CREDENTIAL=""
+YOUTUBE_API_KEY=""
+FIREBASE_ADMIN_SDK_CONFIG=""
+DATABASE_URL=""
+REDIS_URL=""
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --yes)
+      ASSUME_YES="1"
+      ;;
+    --update)
+      UPDATE_ONLY="1"
+      ;;
+    --advanced)
+      ADVANCED="1"
+      ;;
+    --mode)
+      shift
+      DEPLOY_MODE="${1:-}"
+      ;;
+    --mode=*)
+      DEPLOY_MODE="${1#*=}"
+      ;;
+    --dir)
+      shift
+      INSTALL_DIR="${1:-}"
+      ;;
+    --dir=*)
+      INSTALL_DIR="${1#*=}"
+      ;;
+    --port)
+      shift
+      APP_PORT="${1:-}"
+      ;;
+    --port=*)
+      APP_PORT="${1#*=}"
+      ;;
+    --host)
+      shift
+      PUBLIC_HOST="${1:-}"
+      ;;
+    --host=*)
+      PUBLIC_HOST="${1#*=}"
+      ;;
+    --repo)
+      shift
+      REPO_URL="${1:-}"
+      ;;
+    --repo=*)
+      REPO_URL="${1#*=}"
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown option: $1. Use --help for usage."
+      ;;
+  esac
+  shift
+done
+
+[[ "${DEPLOY_MODE}" == "docker" || "${DEPLOY_MODE}" == "native" ]] ||
+  fail "Deployment mode must be docker or native."
+[[ "${APP_PORT}" =~ ^[0-9]+$ ]] || fail "Port must be a number."
+(( APP_PORT >= 1 && APP_PORT <= 65535 )) || fail "Port must be between 1 and 65535."
+[[ -n "${INSTALL_DIR}" ]] || fail "Installation directory cannot be empty."
+[[ -n "${REPO_URL}" ]] || fail "Repository URL cannot be empty."
+
+if [[ -n "${LOCAL_REPO_DIR}" && "${INSTALL_DIR}" == "${DEFAULT_INSTALL_DIR}" ]]; then
+  INSTALL_DIR="${LOCAL_REPO_DIR}"
+fi
+
+if [[ "${UPDATE_ONLY}" == "1" && -f "${INSTALL_DIR}/.env" ]]; then
+  existing_port="$(grep -E '^APP_PORT=' "${INSTALL_DIR}/.env" | head -n 1 | cut -d= -f2- || true)"
+  APP_PORT="${existing_port:-${APP_PORT}}"
+fi
+
+prompt_default() {
+  local prompt="$1"
+  local default_value="$2"
+  local variable_name="$3"
   local value
   read -r -p "${prompt} [${default_value}]: " value
   printf -v "${variable_name}" '%s' "${value:-${default_value}}"
 }
 
 prompt_secret() {
-  local variable_name="$1"
-  local prompt="$2"
+  local prompt="$1"
+  local variable_name="$2"
   local value
   read -r -s -p "${prompt} (optional): " value
   printf '\n'
   printf -v "${variable_name}" '%s' "${value}"
 }
 
-install_packages() {
-  log "Installing required Ubuntu packages."
-  ${SUDO} apt-get update
-  ${SUDO} apt-get install -y ca-certificates curl git
+if [[ "${ASSUME_YES}" != "1" ]]; then
+  prompt_default "Install directory" "${INSTALL_DIR}" INSTALL_DIR
+  prompt_default "Public port" "${APP_PORT}" APP_PORT
+  prompt_default "Public hostname or IP" "${PUBLIC_HOST}" PUBLIC_HOST
+  prompt_default "Deployment mode (docker/native)" "${DEPLOY_MODE}" DEPLOY_MODE
+
+  if [[ "${ADVANCED}" == "1" ]]; then
+    prompt_default "API origin (blank for same origin)" "${VITE_SERVER_HOST}" VITE_SERVER_HOST
+    prompt_default "OAuth redirect origin" \
+      "${VITE_OAUTH_REDIRECT_HOSTNAME:-http://${PUBLIC_HOST}:${APP_PORT}}" \
+      VITE_OAUTH_REDIRECT_HOSTNAME
+    prompt_secret "Firebase web config JSON" VITE_FIREBASE_CONFIG
+    prompt_secret "Stripe public key" VITE_STRIPE_PUBLIC_KEY
+    prompt_default "TURN server URLs" "${VITE_TURN_SERVERS}" VITE_TURN_SERVERS
+    prompt_secret "TURN username" VITE_TURN_USERNAME
+    prompt_secret "TURN credential" VITE_TURN_CREDENTIAL
+    prompt_secret "YouTube API key" YOUTUBE_API_KEY
+    prompt_secret "Firebase Admin SDK JSON" FIREBASE_ADMIN_SDK_CONFIG
+    prompt_secret "Postgres connection URL" DATABASE_URL
+    prompt_secret "Redis connection URL" REDIS_URL
+  fi
+fi
+
+[[ "${DEPLOY_MODE}" == "docker" || "${DEPLOY_MODE}" == "native" ]] ||
+  fail "Deployment mode must be docker or native."
+[[ "${APP_PORT}" =~ ^[0-9]+$ ]] || fail "Port must be a number."
+(( APP_PORT >= 1 && APP_PORT <= 65535 )) || fail "Port must be between 1 and 65535."
+
+prepare_directory() {
+  if [[ -d "${INSTALL_DIR}" ]]; then
+    return
+  fi
+  run_privileged mkdir -p "${INSTALL_DIR}"
+  run_privileged chown "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
 }
 
-install_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+update_or_clone_source() {
+  if [[ -f "${INSTALL_DIR}/package.json" ]]; then
+    if [[ "${UPDATE_ONLY}" == "1" && -d "${INSTALL_DIR}/.git" ]]; then
+      log "Updating the existing Watch checkout."
+      if [[ -w "${INSTALL_DIR}/.git/FETCH_HEAD" || "${EUID}" -eq 0 ]]; then
+        git -C "${INSTALL_DIR}" pull --ff-only
+      else
+        run_privileged git -C "${INSTALL_DIR}" pull --ff-only
+      fi
+    fi
     return
   fi
 
-  if ! ${SUDO} apt-get install -y docker.io docker-compose-v2; then
-    ${SUDO} apt-get install -y docker.io docker-compose-plugin
+  if [[ -n "$(find "${INSTALL_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    fail "${INSTALL_DIR} is not empty and does not contain a Watch checkout."
   fi
-  ${SUDO} systemctl enable --now docker
+
+  log "Downloading Watch from ${REPO_URL}."
+  run_privileged git clone --depth 1 --branch main "${REPO_URL}" "${INSTALL_DIR}"
+  run_privileged chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${INSTALL_DIR}"
 }
 
-quote_env_value() {
+escape_env_value() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
-  printf '"%s"' "${value}"
+  printf '%s' "${value}"
 }
 
 write_env_value() {
-  printf '%s=%s\n' "$1" "$(quote_env_value "$2")"
+  printf '%s="%s"\n' "$1" "$(escape_env_value "$2")"
 }
 
 write_env() {
+  if [[ -f "${INSTALL_DIR}/.env" ]]; then
+    log "Keeping the existing .env file."
+    return
+  fi
+
+  local redirect_origin
+  redirect_origin="${VITE_OAUTH_REDIRECT_HOSTNAME:-http://${PUBLIC_HOST}:${APP_PORT}}"
   umask 077
   {
     printf 'APP_PORT=%s\n' "${APP_PORT}"
@@ -73,7 +255,7 @@ write_env() {
     printf 'HOST=0.0.0.0\n'
     printf 'NODE_ENV=production\n'
     write_env_value "VITE_SERVER_HOST" "${VITE_SERVER_HOST}"
-    write_env_value "VITE_OAUTH_REDIRECT_HOSTNAME" "${VITE_OAUTH_REDIRECT_HOSTNAME}"
+    write_env_value "VITE_OAUTH_REDIRECT_HOSTNAME" "${redirect_origin}"
     write_env_value "VITE_FIREBASE_CONFIG" "${VITE_FIREBASE_CONFIG}"
     write_env_value "VITE_STRIPE_PUBLIC_KEY" "${VITE_STRIPE_PUBLIC_KEY}"
     write_env_value "VITE_TURN_SERVERS" "${VITE_TURN_SERVERS}"
@@ -87,12 +269,37 @@ write_env() {
   chmod 600 "${INSTALL_DIR}/.env"
 }
 
-update_source() {
-  if [[ ! -f "${INSTALL_DIR}/package.json" ]]; then
-    mkdir -p "$(dirname -- "${INSTALL_DIR}")"
-    git clone "${REPO_URL}" "${INSTALL_DIR}"
-  elif [[ -d "${INSTALL_DIR}/.git" && "${UPDATE_ONLY}" == "1" ]]; then
-    git -C "${INSTALL_DIR}" pull --ff-only
+install_packages() {
+  log "Installing required Ubuntu packages."
+  export DEBIAN_FRONTEND=noninteractive
+  run_privileged apt-get update
+  run_privileged apt-get install -y ca-certificates curl git
+}
+
+has_docker_compose() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 ||
+    run_privileged docker compose version >/dev/null 2>&1
+}
+
+install_docker() {
+  if has_docker_compose; then
+    run_privileged systemctl enable --now docker >/dev/null 2>&1 || true
+    return
+  fi
+
+  log "Installing Docker Compose."
+  if ! run_privileged apt-get install -y docker.io docker-compose-v2; then
+    run_privileged apt-get install -y docker.io docker-compose-plugin
+  fi
+  run_privileged systemctl enable --now docker
+}
+
+compose() {
+  if docker info >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    run_privileged docker compose "$@"
   fi
 }
 
@@ -101,18 +308,32 @@ install_docker_mode() {
   log "Building and starting Watch with Docker Compose."
   (
     cd "${INSTALL_DIR}"
-    docker compose up -d --build
-    docker compose ps
+    compose up -d --build
+    compose ps
   )
 }
 
+install_node_24() {
+  local node_major="0"
+  if command -v node >/dev/null 2>&1; then
+    node_major="$(node --version | tr -d 'v' | cut -d. -f1)"
+  fi
+  if [[ "${node_major}" -ge 24 ]]; then
+    return
+  fi
+
+  log "Installing Node.js 24 for the native systemd path."
+  local setup_script
+  setup_script="$(mktemp)"
+  curl -fsSL https://deb.nodesource.com/setup_24.x > "${setup_script}"
+  run_privileged bash "${setup_script}"
+  rm -f "${setup_script}"
+  run_privileged apt-get install -y nodejs
+}
+
 install_native_mode() {
-  log "Installing Node.js and npm for the native systemd path."
-  ${SUDO} apt-get install -y nodejs npm
+  install_node_24
   command -v node >/dev/null 2>&1 || fail "Node.js was not installed."
-  local node_major
-  node_major="$(node --version | tr -d 'v' | cut -d. -f1)"
-  [[ "${node_major}" -ge 24 ]] || fail "Node.js 24 or newer is required. Use Docker mode on older Ubuntu images."
 
   log "Building Watch."
   (
@@ -122,7 +343,7 @@ install_native_mode() {
   )
 
   log "Creating the systemd service."
-  ${SUDO} tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<EOF
+  run_privileged tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<EOF
 [Unit]
 Description=Watch synchronized watch-together server
 After=network.target
@@ -130,67 +351,27 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${INSTALL_DIR}/.env
+EnvironmentFile=-${INSTALL_DIR}/.env
 ExecStart=$(command -v node) server/server.ts
 Restart=always
 RestartSec=5
-User=$(id -un)
+User=${INSTALL_USER}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  ${SUDO} systemctl daemon-reload
-  ${SUDO} systemctl enable --now "${SERVICE_NAME}.service"
-  ${SUDO} systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+  run_privileged systemctl daemon-reload
+  run_privileged systemctl enable --now "${SERVICE_NAME}.service"
+  run_privileged systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 }
 
-UPDATE_ONLY="0"
-if [[ "${1:-}" == "--update" ]]; then
-  UPDATE_ONLY="1"
-fi
+command -v apt-get >/dev/null 2>&1 ||
+  fail "This installer targets Ubuntu/Debian systems."
 
-command -v apt-get >/dev/null 2>&1 || fail "This installer targets Ubuntu/Debian systems."
 install_packages
-
-DEFAULT_REPO="$(git -C "${REPO_DIR}" config --get remote.origin.url 2>/dev/null || true)"
-DEFAULT_REPO="${DEFAULT_REPO:-https://github.com/your-account/watch.git}"
-DEFAULT_INSTALL_DIR="${REPO_DIR}"
-DEFAULT_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
-DEFAULT_HOST="${DEFAULT_HOST:-localhost}"
-
-if [[ "${UPDATE_ONLY}" == "1" && -f "${REPO_DIR}/.env" ]]; then
-  INSTALL_DIR="${REPO_DIR}"
-  REPO_URL="${DEFAULT_REPO}"
-  APP_PORT="$(grep -E '^APP_PORT=' "${INSTALL_DIR}/.env" | cut -d= -f2- || true)"
-  APP_PORT="${APP_PORT:-8080}"
-  PUBLIC_HOST="${DEFAULT_HOST}"
-  DEPLOY_MODE="docker"
-else
-  prompt_value REPO_URL "Repository URL" "${DEFAULT_REPO}"
-  prompt_value INSTALL_DIR "Install directory" "${DEFAULT_INSTALL_DIR}"
-  prompt_value APP_PORT "Public port" "8080"
-  prompt_value PUBLIC_HOST "Public hostname or IP" "${DEFAULT_HOST}"
-  prompt_value DEPLOY_MODE "Deployment mode (docker/native)" "docker"
-
-  prompt_value VITE_SERVER_HOST "API origin (blank for same origin)" ""
-  prompt_value VITE_OAUTH_REDIRECT_HOSTNAME "OAuth redirect origin" "http://${PUBLIC_HOST}:${APP_PORT}"
-  prompt_secret VITE_FIREBASE_CONFIG "Firebase web config JSON"
-  prompt_secret VITE_STRIPE_PUBLIC_KEY "Stripe public key"
-  prompt_value VITE_TURN_SERVERS "TURN server URLs (comma-separated or JSON)" ""
-  prompt_secret VITE_TURN_USERNAME "TURN username"
-  prompt_secret VITE_TURN_CREDENTIAL "TURN credential"
-  prompt_secret YOUTUBE_API_KEY "YouTube API key"
-  prompt_secret FIREBASE_ADMIN_SDK_CONFIG "Firebase Admin SDK JSON"
-  prompt_secret DATABASE_URL "Postgres connection URL"
-  prompt_secret REDIS_URL "Redis connection URL"
-fi
-
-[[ "${DEPLOY_MODE}" == "docker" || "${DEPLOY_MODE}" == "native" ]] || fail "Choose docker or native deployment mode."
-mkdir -p "${INSTALL_DIR}"
-update_source
-if [[ "${UPDATE_ONLY}" != "1" ]]; then
-  write_env
-fi
+prepare_directory
+update_or_clone_source
+write_env
 
 if [[ "${DEPLOY_MODE}" == "docker" ]]; then
   install_docker_mode
@@ -199,10 +380,10 @@ else
 fi
 
 log "Installation complete."
-printf 'URL: http://%s:%s\n' "${PUBLIC_HOST:-localhost}" "${APP_PORT}"
+printf 'URL: http://%s:%s\n' "${PUBLIC_HOST}" "${APP_PORT}"
 if [[ "${DEPLOY_MODE}" == "docker" ]]; then
-  printf 'Status: docker compose -f %s/docker-compose.yml ps\n' "${INSTALL_DIR}"
-  printf 'Logs:   docker compose -f %s/docker-compose.yml logs -f --tail=100\n' "${INSTALL_DIR}"
+  printf 'Status: cd %s && docker compose ps\n' "${INSTALL_DIR}"
+  printf 'Logs:   cd %s && docker compose logs -f --tail=100\n' "${INSTALL_DIR}"
 else
   printf 'Status: sudo systemctl status %s.service\n' "${SERVICE_NAME}"
   printf 'Logs:   sudo journalctl -u %s.service -f\n' "${SERVICE_NAME}"
